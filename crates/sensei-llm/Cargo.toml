@@ -1,0 +1,37 @@
+[package]
+name = "sensei-llm"
+description = "Shared local-LLM coaching runtime (llama.cpp + Gemma 4) for the Sensei apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hf-hub = { version = "0.5", optional = true }
+sha2 = { version = "0.10", optional = true }
+llama-cpp-2 = { version = "0.1.151", optional = true, features = ["sampler"] }
+encoding_rs = { version = "0.8", optional = true }
+
+# macOS builds always get Metal-accelerated inference compiled in (features
+# unify with the base llama-cpp-2 dependency above; no CLI flags needed).
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "0.1.151", optional = true, features = [
+    "sampler",
+    "metal",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# Model download + integrity verification (hf-hub, sha2). Pure Rust, no
+# native llama.cpp build.
+download = ["dep:hf-hub", "dep:sha2"]
+# Inference via llama.cpp. Compiles the native library (cmake required).
+llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# GPU backend passthroughs. Metal is always compiled in on macOS regardless.
+metal = ["llm", "llama-cpp-2/metal"]
+cuda = ["llm", "llama-cpp-2/cuda"]
