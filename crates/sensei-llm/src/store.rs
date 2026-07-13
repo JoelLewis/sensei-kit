@@ -107,6 +107,10 @@ impl ModelStore {
     /// only warn — llama.cpp validates GGUF integrity at load time, so a size
     /// drift usually means upstream requantization).
     ///
+    /// An already-downloaded model is verified before being trusted: size
+    /// always, sha256 once — a sidecar marker records a passed verification
+    /// so later calls skip re-hashing multi-gigabyte files.
+    ///
     /// This is a blocking operation — call from `spawn_blocking`.
     pub fn download(
         &self,
@@ -157,6 +161,7 @@ impl ModelStore {
             }
 
             warn!("Removing invalid cached model at {}", target.display());
+            let _ = std::fs::remove_file(verified_marker_path(&target, spec));
             std::fs::remove_file(&target)
                 .map_err(|e| LlmError::Download(format!("remove invalid model: {e}")))?;
         }
@@ -206,8 +211,28 @@ impl ModelStore {
             }
         }
 
+        if let Some(expected_hash) = spec.sha256 {
+            record_verified(&target, spec, expected_hash);
+        }
+
         info!("Model download complete: {}", spec.filename);
         Ok(target)
+    }
+}
+
+/// Sidecar file recording that the model at the final path passed hash
+/// verification, so startups don't re-hash multi-gigabyte files.
+fn verified_marker_path(target: &Path, spec: &ModelSpec) -> PathBuf {
+    target.with_file_name(format!(".{}.verified", spec.filename))
+}
+
+fn record_verified(target: &Path, spec: &ModelSpec, expected_hash: &str) {
+    let marker = verified_marker_path(target, spec);
+    if let Err(e) = std::fs::write(&marker, expected_hash) {
+        warn!(
+            "Failed to write verification marker {}: {e}",
+            marker.display()
+        );
     }
 }
 
@@ -215,11 +240,27 @@ fn cached_model_is_valid(path: &Path, spec: &ModelSpec) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
+    if metadata.len() != spec.size_bytes {
+        return false;
+    }
 
-    metadata.len() == spec.size_bytes
-        && spec
-            .sha256
-            .is_none_or(|expected_hash| verify_hash(path, expected_hash).is_ok())
+    let Some(expected_hash) = spec.sha256 else {
+        return true;
+    };
+
+    // A marker recording this exact hash means the full-file verification
+    // already ran once; skip re-hashing gigabytes on every startup.
+    let marker_valid = std::fs::read_to_string(verified_marker_path(path, spec))
+        .is_ok_and(|recorded| recorded.trim() == expected_hash);
+    if marker_valid {
+        return true;
+    }
+
+    if verify_hash(path, expected_hash).is_err() {
+        return false;
+    }
+    record_verified(path, spec, expected_hash);
+    true
 }
 
 #[cfg(unix)]
@@ -388,6 +429,86 @@ mod tests {
         assert_eq!(result.unwrap(), model_path);
         assert_eq!(fetches, 1);
         assert_eq!(std::fs::read(model_path).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn cached_file_with_correct_hash_is_trusted_and_marker_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"hello world").unwrap();
+
+        let mut fetches = 0;
+        let result = store.download_with_fetcher(
+            &HASHED_TEST_SPEC,
+            |_, _| {},
+            |_, _| {
+                fetches += 1;
+                Err(LlmError::Download("must not fetch".into()))
+            },
+        );
+
+        assert_eq!(result.unwrap(), model_path);
+        assert_eq!(fetches, 0);
+        let marker = verified_marker_path(&model_path, &HASHED_TEST_SPEC);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            HASHED_TEST_SPEC.sha256.unwrap(),
+            "passed verification must be recorded so later calls skip re-hashing"
+        );
+    }
+
+    #[test]
+    fn stale_marker_for_different_hash_does_not_validate_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"wrong bytes").unwrap();
+        std::fs::write(
+            verified_marker_path(&model_path, &HASHED_TEST_SPEC),
+            "hash-of-a-previous-model-rev",
+        )
+        .unwrap();
+
+        let fetched_path = tmp.path().join("fetched.gguf");
+        std::fs::write(&fetched_path, b"hello world").unwrap();
+        let mut fetches = 0;
+        let result = store.download_with_fetcher(
+            &HASHED_TEST_SPEC,
+            |_, _| {},
+            |_, _| {
+                fetches += 1;
+                Ok(fetched_path.clone())
+            },
+        );
+
+        assert_eq!(result.unwrap(), model_path);
+        assert_eq!(fetches, 1, "stale marker must not skip re-verification");
+    }
+
+    #[test]
+    fn fresh_download_records_verification_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+
+        let fetched_path = tmp.path().join("fetched.gguf");
+        std::fs::write(&fetched_path, b"hello world").unwrap();
+        store
+            .download_with_fetcher(
+                &HASHED_TEST_SPEC,
+                |_, _| {},
+                |_, _| Ok(fetched_path.clone()),
+            )
+            .unwrap();
+
+        let marker = verified_marker_path(&model_path, &HASHED_TEST_SPEC);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            HASHED_TEST_SPEC.sha256.unwrap()
+        );
     }
 
     #[test]
