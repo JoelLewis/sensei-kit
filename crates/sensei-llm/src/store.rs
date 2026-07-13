@@ -107,20 +107,64 @@ impl ModelStore {
     /// only warn — llama.cpp validates GGUF integrity at load time, so a size
     /// drift usually means upstream requantization).
     ///
+    /// An already-downloaded model is verified before being trusted: size
+    /// always, sha256 once — a sidecar marker records a passed verification
+    /// so later calls skip re-hashing multi-gigabyte files.
+    ///
     /// This is a blocking operation — call from `spawn_blocking`.
     pub fn download(
         &self,
         spec: &ModelSpec,
-        mut on_progress: impl FnMut(u64, u64),
+        on_progress: impl FnMut(u64, u64),
     ) -> Result<PathBuf, LlmError> {
+        info!("Downloading model from {}/{}", spec.repo_id, spec.filename);
+
+        self.download_with_fetcher(spec, on_progress, |on_progress, total| {
+            let api = hf_hub::api::sync::ApiBuilder::new()
+                .with_cache_dir(self.models_dir.join("hf-cache"))
+                .build()
+                .map_err(|e| LlmError::Download(format!("HF API init: {e}")))?;
+
+            let repo = api.model(spec.repo_id.to_string());
+
+            // Signal download start with the published size until the server
+            // tells us more.
+            on_progress(0, total);
+
+            let progress = ThrottledProgress {
+                on_progress,
+                downloaded: 0,
+                total,
+                last_reported: 0,
+            };
+
+            repo.download_with_progress(spec.filename, progress)
+                .map_err(|e| LlmError::Download(format!("download: {e}")))
+        })
+    }
+
+    fn download_with_fetcher<F>(
+        &self,
+        spec: &ModelSpec,
+        mut on_progress: impl FnMut(u64, u64),
+        fetch: F,
+    ) -> Result<PathBuf, LlmError>
+    where
+        F: FnOnce(&mut dyn FnMut(u64, u64), u64) -> Result<PathBuf, LlmError>,
+    {
         let target = self.models_dir.join(spec.repo_id).join(spec.filename);
 
         if target.exists() {
-            info!("Model already cached at {}", target.display());
-            return Ok(target);
-        }
+            if cached_model_is_valid(&target, spec) {
+                info!("Model already cached at {}", target.display());
+                return Ok(target);
+            }
 
-        info!("Downloading model from {}/{}", spec.repo_id, spec.filename);
+            warn!("Removing invalid cached model at {}", target.display());
+            let _ = std::fs::remove_file(verified_marker_path(&target, spec));
+            std::fs::remove_file(&target)
+                .map_err(|e| LlmError::Download(format!("remove invalid model: {e}")))?;
+        }
 
         let target_dir = target
             .parent()
@@ -128,27 +172,7 @@ impl ModelStore {
         std::fs::create_dir_all(target_dir)
             .map_err(|e| LlmError::Download(format!("create model dir: {e}")))?;
 
-        let api = hf_hub::api::sync::ApiBuilder::new()
-            .with_cache_dir(self.models_dir.join("hf-cache"))
-            .build()
-            .map_err(|e| LlmError::Download(format!("HF API init: {e}")))?;
-
-        let repo = api.model(spec.repo_id.to_string());
-
-        // Signal download start with the published size until the server
-        // tells us more.
-        on_progress(0, spec.size_bytes);
-
-        let progress = ThrottledProgress {
-            on_progress: &mut on_progress,
-            downloaded: 0,
-            total: spec.size_bytes,
-            last_reported: 0,
-        };
-
-        let downloaded_path = repo
-            .download_with_progress(spec.filename, progress)
-            .map_err(|e| LlmError::Download(format!("download: {e}")))?;
+        let downloaded_path = fetch(&mut on_progress, spec.size_bytes)?;
 
         info!("Model downloaded to {}", downloaded_path.display());
 
@@ -171,15 +195,72 @@ impl ModelStore {
             );
         }
 
-        // hf-hub caches files in its own snapshot structure; link to the
-        // stable path that `model_path` resolves.
-        if downloaded_path != target && !target.exists() {
-            link_or_copy(&downloaded_path, &target)?;
+        // hf-hub caches files in its own snapshot structure; link to a
+        // temporary stable path and atomically rename it into place so an
+        // interrupted materialization cannot leave a plausible final file.
+        if downloaded_path != target {
+            let temporary = target.with_file_name(format!(".{}.part", spec.filename));
+            let _ = std::fs::remove_file(&temporary);
+            if let Err(error) = link_or_copy(&downloaded_path, &temporary).and_then(|_| {
+                std::fs::rename(&temporary, &target).map_err(|e| {
+                    LlmError::Download(format!("rename downloaded model into place: {e}"))
+                })
+            }) {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
+
+        if let Some(expected_hash) = spec.sha256 {
+            record_verified(&target, spec, expected_hash);
         }
 
         info!("Model download complete: {}", spec.filename);
         Ok(target)
     }
+}
+
+/// Sidecar file recording that the model at the final path passed hash
+/// verification, so startups don't re-hash multi-gigabyte files.
+fn verified_marker_path(target: &Path, spec: &ModelSpec) -> PathBuf {
+    target.with_file_name(format!(".{}.verified", spec.filename))
+}
+
+fn record_verified(target: &Path, spec: &ModelSpec, expected_hash: &str) {
+    let marker = verified_marker_path(target, spec);
+    if let Err(e) = std::fs::write(&marker, expected_hash) {
+        warn!(
+            "Failed to write verification marker {}: {e}",
+            marker.display()
+        );
+    }
+}
+
+fn cached_model_is_valid(path: &Path, spec: &ModelSpec) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != spec.size_bytes {
+        return false;
+    }
+
+    let Some(expected_hash) = spec.sha256 else {
+        return true;
+    };
+
+    // A marker recording this exact hash means the full-file verification
+    // already ran once; skip re-hashing gigabytes on every startup.
+    let marker_valid = std::fs::read_to_string(verified_marker_path(path, spec))
+        .is_ok_and(|recorded| recorded.trim() == expected_hash);
+    if marker_valid {
+        return true;
+    }
+
+    if verify_hash(path, expected_hash).is_err() {
+        return false;
+    }
+    record_verified(path, spec, expected_hash);
+    true
 }
 
 #[cfg(unix)]
@@ -241,6 +322,13 @@ mod tests {
         sha256: None,
     };
 
+    const HASHED_TEST_SPEC: ModelSpec = ModelSpec {
+        repo_id: "test/repo",
+        filename: "hashed-model.gguf",
+        size_bytes: 11,
+        sha256: Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"),
+    };
+
     #[test]
     fn model_path_without_resource_dir() {
         let store = ModelStore::new("/tmp/test-models");
@@ -285,18 +373,163 @@ mod tests {
     }
 
     #[test]
-    fn download_returns_cached_path_without_network() {
+    fn download_truncated_cached_file_is_not_trusted() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ModelStore::new(tmp.path());
 
         let model_path = store.model_path(&TEST_SPEC);
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
-        std::fs::write(&model_path, b"fake gguf data").unwrap();
+        std::fs::write(&model_path, b"truncated").unwrap();
+
+        let mut calls = 0u32;
+        let result = store.download(&TEST_SPEC, |_, _| calls += 1);
+        assert!(result.is_err(), "an invalid cache must trigger a download");
+        assert!(calls > 0, "an invalid cache must report download progress");
+        assert!(
+            !model_path.exists(),
+            "failed download must not leave a target"
+        );
+    }
+
+    #[test]
+    fn download_returns_complete_cached_path_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+
+        let model_path = store.model_path(&TEST_SPEC);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, vec![0u8; TEST_SPEC.size_bytes as usize]).unwrap();
 
         let mut calls = 0u32;
         let result = store.download(&TEST_SPEC, |_, _| calls += 1);
         assert_eq!(result.unwrap(), model_path);
-        assert_eq!(calls, 0, "cached hit should not report progress");
+        assert_eq!(calls, 0, "complete cached hit should not report progress");
+    }
+
+    #[test]
+    fn download_same_size_cached_file_with_wrong_hash_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"wrong bytes").unwrap();
+
+        let fetched_path = tmp.path().join("fetched.gguf");
+        std::fs::write(&fetched_path, b"hello world").unwrap();
+        let mut fetches = 0;
+        let result = store.download_with_fetcher(
+            &HASHED_TEST_SPEC,
+            |_, _| {},
+            |_, _| {
+                fetches += 1;
+                Ok(fetched_path.clone())
+            },
+        );
+
+        assert_eq!(result.unwrap(), model_path);
+        assert_eq!(fetches, 1);
+        assert_eq!(std::fs::read(model_path).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn cached_file_with_correct_hash_is_trusted_and_marker_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"hello world").unwrap();
+
+        let mut fetches = 0;
+        let result = store.download_with_fetcher(
+            &HASHED_TEST_SPEC,
+            |_, _| {},
+            |_, _| {
+                fetches += 1;
+                Err(LlmError::Download("must not fetch".into()))
+            },
+        );
+
+        assert_eq!(result.unwrap(), model_path);
+        assert_eq!(fetches, 0);
+        let marker = verified_marker_path(&model_path, &HASHED_TEST_SPEC);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            HASHED_TEST_SPEC.sha256.unwrap(),
+            "passed verification must be recorded so later calls skip re-hashing"
+        );
+    }
+
+    #[test]
+    fn stale_marker_for_different_hash_does_not_validate_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"wrong bytes").unwrap();
+        std::fs::write(
+            verified_marker_path(&model_path, &HASHED_TEST_SPEC),
+            "hash-of-a-previous-model-rev",
+        )
+        .unwrap();
+
+        let fetched_path = tmp.path().join("fetched.gguf");
+        std::fs::write(&fetched_path, b"hello world").unwrap();
+        let mut fetches = 0;
+        let result = store.download_with_fetcher(
+            &HASHED_TEST_SPEC,
+            |_, _| {},
+            |_, _| {
+                fetches += 1;
+                Ok(fetched_path.clone())
+            },
+        );
+
+        assert_eq!(result.unwrap(), model_path);
+        assert_eq!(fetches, 1, "stale marker must not skip re-verification");
+    }
+
+    #[test]
+    fn fresh_download_records_verification_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&HASHED_TEST_SPEC);
+
+        let fetched_path = tmp.path().join("fetched.gguf");
+        std::fs::write(&fetched_path, b"hello world").unwrap();
+        store
+            .download_with_fetcher(
+                &HASHED_TEST_SPEC,
+                |_, _| {},
+                |_, _| Ok(fetched_path.clone()),
+            )
+            .unwrap();
+
+        let marker = verified_marker_path(&model_path, &HASHED_TEST_SPEC);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            HASHED_TEST_SPEC.sha256.unwrap()
+        );
+    }
+
+    #[test]
+    fn interrupted_download_never_leaves_file_at_final_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let model_path = store.model_path(&TEST_SPEC);
+
+        let result = store.download_with_fetcher(
+            &TEST_SPEC,
+            |_, _| {},
+            |_, _| {
+                let partial_path = model_path.with_file_name(".model.gguf.part");
+                std::fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
+                std::fs::write(partial_path, b"partial download").unwrap();
+                Err(LlmError::Download("interrupted download".into()))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!model_path.exists());
     }
 
     #[test]
